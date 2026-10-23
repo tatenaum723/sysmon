@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=System Monitor HUD
+Comment=Always-on-top CPU/GPU temperature and usage bar (~/bin/sysmon-hud)
+Exec=/home/tate/bin/sysmon-hud
+Terminal=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=5
+NoDisplay=false

@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+"""Always-on-top CPU/GPU HUD for this box (Ryzen 7 9700X + RTX 5070).
+
+GTK3, not GTK4, for one hard reason: GTK4 removed set_keep_above() entirely
+(dropped for Wayland portability), so a GTK4 window cannot stay on top on X11.
+GTK3 still has keep-above, undecorated, stick, and skip-taskbar.
+
+NVIDIA is not exposed via hwmon on this machine, so GPU numbers come from
+nvidia-smi; CPU temps come from k10temp.
+
+  window buttons    top-left:  x quit   -  collapse   [] expand/restore
+  left drag         move
+  bottom-right drag resize (when expanded)
+  left click body   collapse / expand
+  right click       menu
+
+Position, size and collapsed state persist to ~/.config/sysmon-hud.json.
+"""
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gtk, Gdk, GLib  # noqa: E402
+
+import json  # noqa: E402
+import math  # noqa: E402
+import os  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+from collections import deque  # noqa: E402
+
+from sysmon_gpu import read_gpu  # noqa: E402
+
+HISTORY = 90
+INTERVAL = 1.0
+
+W_MIN, H_MIN = 300, 120
+H_BAR = 30                 # collapsed height
+W_DEF, H_DEF = 400, 178    # expanded default
+H_TALL = 330               # what the [] button expands to
+GRIP = 16                  # bottom-right resize hit area
+
+# SYSMON_HUD_CONF lets a throwaway instance avoid clobbering the real saved
+# state (used for screenshot testing).
+CONF = os.environ.get("SYSMON_HUD_CONF") or \
+    os.path.expanduser("~/.config/sysmon-hud.json")
+
+# ---- palette (dataviz reference instance, dark steps) ----------------------
+INK = (1.0, 1.0, 1.0)
+MUTED = (0x89 / 255, 0x87 / 255, 0x81 / 255)
+GRID = (0x2c / 255, 0x2c / 255, 0x2a / 255)
+BLUE = (0x39 / 255, 0x87 / 255, 0xe5 / 255)
+ORANGE = (0xd9 / 255, 0x59 / 255, 0x26 / 255)
+VIOLET = (0x90 / 255, 0x85 / 255, 0xe9 / 255)
+ST_GOOD = (0x0c / 255, 0xa3 / 255, 0x0c / 255)
+ST_WARN = (0xfa / 255, 0xb2 / 255, 0x19 / 255)
+ST_CRIT = (0xd0 / 255, 0x3b / 255, 0x3b / 255)
+
+
+def status_rgb(v, warn, hot):
+    if v is None:
+        return MUTED
+    if v >= hot:
+        return ST_CRIT
+    if v >= warn:
+        return ST_WARN
+    return ST_GOOD
+
+
+# ---- sampling --------------------------------------------------------------
+def _hwmon():
+    out, base = {}, "/sys/class/hwmon"
+    for d in sorted(os.listdir(base)):
+        p = os.path.join(base, d)
+        try:
+            with open(os.path.join(p, "name")) as f:
+                out.setdefault(f.read().strip(), p)
+        except OSError:
+            pass
+    return out
+
+
+HW = _hwmon()
+
+
+def temp(dev, label):
+    p = HW.get(dev)
+    if not p:
+        return None
+    try:
+        for f in sorted(os.listdir(p)):
+            if f.endswith("_label"):
+                with open(os.path.join(p, f)) as fh:
+                    if fh.read().strip() != label:
+                        continue
+                with open(os.path.join(p, f.replace("_label", "_input"))) as fh:
+                    return int(fh.read().strip()) / 1000.0
+    except OSError:
+        pass
+    return None
+
+
+def cpu_times():
+    with open("/proc/stat") as f:
+        v = [int(x) for x in f.readline().split()[1:]]
+    return sum(v), v[3] + v[4]
+
+
+def runs(pts):
+    """Split a history into runs of consecutive (index, value) non-None points."""
+    out, cur = [], []
+    for i, v in enumerate(pts):
+        if v is None:
+            if cur:
+                out.append(cur)
+            cur = []
+        else:
+            cur.append((i, v))
+    if cur:
+        out.append(cur)
+    return out
+
+
+class Sampler(threading.Thread):
+    """Background poll so nvidia-smi never stalls the UI."""
+
+    daemon = True
+
+    def __init__(self):
+        super().__init__()
+        self.lock = threading.Lock()
+        self.h = {k: deque([], HISTORY)
+                  for k in ("cpu", "ctemp", "gpu", "gtemp", "vram", "gpower")}
+        self.cur = {}
+        self._prev = cpu_times()
+
+    def run(self):
+        while True:
+            tot, idle = cpu_times()
+            dt, di = tot - self._prev[0], idle - self._prev[1]
+            c = (1 - di / dt) * 100 if dt > 0 else 0.0
+            self._prev = (tot, idle)
+            tctl, tccd = temp("k10temp", "Tctl"), temp("k10temp", "Tccd1")
+            g = read_gpu() or {}
+            with self.lock:
+                self.cur = {"cpu": c, "tctl": tctl, "tccd": tccd, **g}
+                self.h["cpu"].append(c)
+                self.h["ctemp"].append(tctl or 0)
+                # GPU samples stay None when unreadable; the sparkline draws
+                # a gap there instead of a fake drop to zero.
+                self.h["gpu"].append(g.get("util"))
+                self.h["gtemp"].append(g.get("temp"))
+                vu, vt = g.get("vram"), g.get("vram_total")
+                self.h["vram"].append(vu / vt * 100 if vu is not None and vt else None)
+                self.h["gpower"].append(g.get("power"))
+            time.sleep(INTERVAL)
+
+    def snap(self):
+        with self.lock:
+            return dict(self.cur), {k: list(v) for k, v in self.h.items()}
+
+
+# ---- HUD -------------------------------------------------------------------
+BTN_Y = 15
+BTN_X = (18, 38, 58)          # quit, collapse, expand
+BTN_R = 6
+
+
+class Hud(Gtk.Window):
+    def __init__(self, sampler):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.s = sampler
+        cfg = self._load()
+        self.collapsed = cfg.get("collapsed", True)
+        self.w = max(W_MIN, cfg.get("w", W_DEF))
+        self.h = max(H_MIN, cfg.get("h", H_DEF))
+        self.hover = -1
+
+        self.set_decorated(False)          # no titlebar -- it's a widget
+        self.set_keep_above(True)          # the whole point: never buried
+        self.stick()                       # follow across workspaces
+        self.set_skip_taskbar_hint(True)   # stay out of alt-tab
+        self.set_skip_pager_hint(True)
+        self.set_app_paintable(True)
+        self.set_title("sysmon-hud")
+
+        vis = self.get_screen().get_rgba_visual()
+        if vis:                            # real transparency + rounded corners
+            self.set_visual(vis)
+
+        self.da = Gtk.DrawingArea()
+        self.da.connect("draw", self.on_draw)
+        self.add(self.da)
+
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK
+                        | Gdk.EventMask.BUTTON_RELEASE_MASK
+                        | Gdk.EventMask.POINTER_MOTION_MASK
+                        | Gdk.EventMask.BUTTON1_MOTION_MASK
+                        | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        self.connect("button-press-event", self.on_press)
+        self.connect("button-release-event", self.on_release)
+        self.connect("motion-notify-event", self.on_motion)
+        self.connect("leave-notify-event", self.on_leave)
+        self.connect("destroy", Gtk.main_quit)
+        self.connect("configure-event", self.on_configure)
+        self._press = None
+
+        self.menu = Gtk.Menu()
+        for lbl, cb in (("Collapse / expand", lambda *_: self.toggle()),
+                        ("Quit", lambda *_: Gtk.main_quit())):
+            mi = Gtk.MenuItem(label=lbl)
+            mi.connect("activate", cb)
+            self.menu.append(mi)
+        self.menu.show_all()
+
+        self._apply_size()
+        self.move(cfg.get("x", 40), cfg.get("y", 40))
+        GLib.timeout_add(1000, self.tick)
+
+    # -- persistence
+    def _load(self):
+        try:
+            with open(CONF) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(CONF), exist_ok=True)
+            x, y = self.get_position()
+            with open(CONF, "w") as f:
+                json.dump({"x": x, "y": y, "w": self.w, "h": self.h,
+                           "collapsed": self.collapsed}, f)
+        except Exception:
+            pass
+
+    def _apply_size(self):
+        h = H_BAR if self.collapsed else self.h
+        # Collapsed is a fixed bar; expanded is freely resizable by dragging
+        # the bottom-right corner.
+        self.set_resizable(not self.collapsed)
+        if self.collapsed:
+            self.set_size_request(self.w, H_BAR)
+        else:
+            self.set_size_request(W_MIN, H_MIN)
+        self.resize(self.w, h)
+
+    def on_configure(self, _w, ev):
+        # Track user resizes so they persist. Ignore while collapsed.
+        if not self.collapsed and ev.width >= W_MIN and ev.height >= H_MIN:
+            if (ev.width, ev.height) != (self.w, self.h):
+                self.w, self.h = ev.width, ev.height
+                self._save()
+        return False
+
+    def toggle(self):
+        self.collapsed = not self.collapsed
+        self._apply_size()
+        self._save()
+
+    # -- input
+    def _hit_button(self, x, y):
+        if abs(y - BTN_Y) > 10:
+            return -1
+        for i, bx in enumerate(BTN_X):
+            if abs(x - bx) <= 9:
+                return i
+        return -1
+
+    def _in_grip(self, x, y):
+        if self.collapsed:
+            return False
+        a = self.get_allocation()
+        return x >= a.width - GRIP and y >= a.height - GRIP
+
+    def on_press(self, _w, ev):
+        if ev.button == 3:
+            self.menu.popup_at_pointer(ev)
+            return True
+        if ev.button != 1:
+            return True
+        b = self._hit_button(ev.x, ev.y)
+        if b == 0:                      # x  -> quit
+            Gtk.main_quit()
+            return True
+        if b == 1:                      # -  -> collapse
+            if not self.collapsed:
+                self.toggle()
+            return True
+        if b == 2:                      # [] -> expand / restore
+            if self.collapsed:
+                self.collapsed = False
+                self._apply_size()
+            else:
+                self.h = H_DEF if self.h >= H_TALL else H_TALL
+                self._apply_size()
+            self._save()
+            return True
+        if self._in_grip(ev.x, ev.y):   # corner -> resize
+            self.begin_resize_drag(Gdk.WindowEdge.SOUTH_EAST, 1,
+                                   int(ev.x_root), int(ev.y_root), ev.time)
+            return True
+        self._press = (ev.x_root, ev.y_root, ev.time)
+        return True
+
+    def on_motion(self, _w, ev):
+        h = self._hit_button(ev.x, ev.y)
+        if h != self.hover:
+            self.hover = h
+            self.da.queue_draw()
+        if not self._press:
+            return False
+        dx = abs(ev.x_root - self._press[0])
+        dy = abs(ev.y_root - self._press[1])
+        if dx > 4 or dy > 4:            # a real drag -> hand off to the WM
+            self.begin_move_drag(1, int(self._press[0]), int(self._press[1]),
+                                 self._press[2])
+            self._press = None
+        return True
+
+    def on_leave(self, *_):
+        if self.hover != -1:
+            self.hover = -1
+            self.da.queue_draw()
+        return False
+
+    def on_release(self, _w, ev):
+        if ev.button == 1 and self._press:   # click without drag -> toggle
+            self.toggle()
+        self._press = None
+        return True
+
+    def tick(self):
+        self.da.queue_draw()
+        return True
+
+    # -- drawing
+    def on_draw(self, _w, cr):
+        cur, hist = self.s.snap()
+        a = self.get_allocation()
+        w, h = a.width, a.height
+
+        cr.set_operator(1)                  # SOURCE: start fully transparent
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(2)                  # OVER
+
+        r = 8
+        cr.new_sub_path()
+        cr.arc(w - r, r, r, -math.pi / 2, 0)
+        cr.arc(w - r, h - r, r, 0, math.pi / 2)
+        cr.arc(r, h - r, r, math.pi / 2, math.pi)
+        cr.arc(r, r, r, math.pi, 3 * math.pi / 2)
+        cr.close_path()
+        cr.set_source_rgba(0x14 / 255, 0x14 / 255, 0x13 / 255, 0.92)
+        cr.fill_preserve()
+        cr.set_source_rgba(1, 1, 1, 0.10)   # hairline ring
+        cr.set_line_width(1)
+        cr.stroke()
+
+        self._draw_buttons(cr)
+
+        def txt(x, y, s, rgb, size, bold=False):
+            cr.select_font_face("sans-serif", 0, 1 if bold else 0)
+            cr.set_font_size(size)
+            cr.set_source_rgb(*rgb)
+            cr.move_to(x, y)
+            cr.show_text(s)
+            return x + cr.text_extents(s)[4]
+
+        # ---- the always-visible line ------------------------------------
+        y, x = 20, 78
+        ct, gt = cur.get("tctl"), cur.get("temp")
+        x = txt(x, y, "CPU ", MUTED, 11)
+        x = txt(x, y, f"{cur.get('cpu') or 0:.0f}%", INK, 12, bold=True)
+        x = txt(x + 5, y, f"{ct:.0f}°" if ct else "--",
+                status_rgb(ct, 75, 90), 12, bold=True)
+        x = txt(x + 14, y, "GPU ", MUTED, 11)
+        gu = cur.get("util")
+        x = txt(x, y, f"{gu:.0f}%" if gu is not None else "--", INK, 12, bold=True)
+        x = txt(x + 5, y, f"{gt:.0f}°" if gt else "--",
+                status_rgb(gt, 75, 84), 12, bold=True)
+        x = txt(x + 14, y, "VRAM ", MUTED, 11)
+        vr = cur.get("vram")
+        txt(x, y, f"{vr/1024:.1f}G" if vr is not None else "--", INK, 12, bold=True)
+
+        if self.collapsed:
+            return
+
+        # ---- sparkline rows ----------------------------------------------
+        # VRAM is deliberately NOT graphed: SGLang preallocates its KV pool, so
+        # the line is pinned near 96% forever and carries no information. It
+        # stays as a number in the bar above. GPU *power* takes the slot -- it
+        # swings 4W..250W and keeps resolving after utilisation saturates.
+        plim = cur.get("power_limit") or 250
+        rows = [
+            ("CPU",    "cpu",    BLUE,   100,  lambda v: f"{v:.0f}%"),
+            ("CPU °C", "ctemp",  BLUE,   100,  lambda v: f"{v:.0f}°"),
+            ("GPU",    "gpu",    ORANGE, 100,  lambda v: f"{v:.0f}%"),
+            ("GPU W",  "gpower", VIOLET, plim, lambda v: f"{v:.0f}W"),
+        ]
+        top = 38
+        rh = (h - top - 12) / len(rows)
+        lab_w, val_w = 46, 40
+        for i, (label, key, rgb, vmax, fmt) in enumerate(rows):
+            ry = top + i * rh
+            mid = ry + rh / 2 + 3
+            txt(14, mid, label, MUTED, 9.5)
+
+            gx = 14 + lab_w
+            gw = w - gx - val_w - 14
+            gy, gh = ry + 2, rh - 6
+            if gh < 6 or gw < 20:
+                continue
+
+            pts = hist.get(key, [])
+            cur_v = pts[-1] if pts else None
+
+            cr.set_source_rgb(*GRID)         # baseline, not a midline: the
+            cr.set_line_width(1)             # plot reads against zero
+            cr.move_to(gx, gy + gh + 0.5)
+            cr.line_to(gx + gw, gy + gh + 0.5)
+            cr.stroke()
+
+            if len(pts) >= 2:
+                step = gw / (HISTORY - 1)
+                x0 = gx + gw - step * (len(pts) - 1)
+
+                def yv(v):
+                    return gy + gh - min(max(v / vmax, 0), 1) * (gh - 1)
+
+                # None = unreadable sample: break the line rather than plot 0.
+                for run in runs(pts):
+                    if len(run) < 2:
+                        continue
+                    j0, j1 = run[0][0], run[-1][0]
+                    cr.move_to(x0 + j0 * step, gy + gh)
+                    for j, v in run:
+                        cr.line_to(x0 + j * step, yv(v))
+                    cr.line_to(x0 + j1 * step, gy + gh)
+                    cr.close_path()
+                    cr.set_source_rgba(*rgb, 0.22)
+                    cr.fill()
+
+                    cr.set_line_width(1.6)
+                    cr.move_to(x0 + j0 * step, yv(run[0][1]))
+                    for j, v in run:
+                        cr.line_to(x0 + j * step, yv(v))
+                    cr.set_source_rgb(*rgb)
+                    cr.stroke()
+
+                # live marker on the newest sample, so the eye lands on "now"
+                if cur_v is not None:
+                    cx, cy = gx + gw, yv(cur_v)
+                    cr.arc(cx, cy, 2.2, 0, 2 * math.pi)
+                    cr.set_source_rgb(*rgb)
+                    cr.fill()
+
+            # current value, right-aligned -- a sparkline without its number
+            # makes you estimate off pixel height
+            cr.select_font_face("sans-serif", 0, 1)
+            cr.set_font_size(10.5)
+            s = fmt(cur_v) if cur_v is not None else "--"
+            cr.set_source_rgb(*INK)
+            cr.move_to(w - 14 - cr.text_extents(s)[4], mid)
+            cr.show_text(s)
+
+        self._draw_grip(cr, w, h)
+
+    def _draw_buttons(self, cr):
+        """x / - / [] at top-left.
+
+        Deliberately NOT macOS traffic lights: red/amber/green already carry
+        temperature status a few pixels to the right, and a red dot in the
+        corner would read as 'critical'. Neutral glyphs, lit on hover.
+        """
+        cr.set_line_width(1.4)
+        cr.set_line_cap(1)
+        for i, bx in enumerate(BTN_X):
+            lit = (self.hover == i)
+            if lit:
+                cr.arc(bx, BTN_Y, BTN_R + 2.5, 0, 2 * math.pi)
+                cr.set_source_rgba(1, 1, 1, 0.12)
+                cr.fill()
+            g = 0.95 if lit else 0.55
+            cr.set_source_rgb(g, g, g)
+            d = 3.2
+            if i == 0:                                   # x
+                cr.move_to(bx - d, BTN_Y - d)
+                cr.line_to(bx + d, BTN_Y + d)
+                cr.move_to(bx + d, BTN_Y - d)
+                cr.line_to(bx - d, BTN_Y + d)
+                cr.stroke()
+            elif i == 1:                                 # minimise
+                cr.move_to(bx - d, BTN_Y)
+                cr.line_to(bx + d, BTN_Y)
+                cr.stroke()
+            else:                                        # expand / restore
+                cr.rectangle(bx - d, BTN_Y - d, d * 2, d * 2)
+                cr.stroke()
+
+    def _draw_grip(self, cr, w, h):
+        """Three hairlines marking the drag-to-resize corner."""
+        cr.set_line_width(1)
+        cr.set_source_rgba(1, 1, 1, 0.22)
+        for k in (3, 7, 11):
+            cr.move_to(w - 5 - k, h - 5)
+            cr.line_to(w - 5, h - 5 - k)
+        cr.stroke()
+
+
+def main():
+    s = Sampler()
+    s.start()
+    time.sleep(0.3)               # one sample before first paint
+    hud = Hud(s)
+    hud.show_all()
+    hud.set_keep_above(True)      # re-assert after realize; some WMs drop it
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

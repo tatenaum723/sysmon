@@ -1,0 +1,10 @@
+# ~/bin holds other tools too; track only the sysmon set.
+*
+!.gitignore
+!README.md
+!sysmon
+!sysmon-gui
+!sysmon-hud
+!sysmon_gpu.py
+!autostart/
+!autostart/sysmon-hud.desktop

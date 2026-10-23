@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""GTK4 system monitor for this box: Ryzen 7 9700X + RTX 5070.
+
+Why this exists rather than psensor/Vitals: NVIDIA exposes nothing through
+hwmon on this machine, so generic sensor apps show the CPU but not the GPU.
+GPU stats here come from nvidia-smi.
+
+Colours are the dataviz reference palette verbatim (categorical slots in fixed
+order; the reserved status palette for temperature, always paired with a text
+label so state is never carried by colour alone).
+
+Run:  sysmon-gui
+"""
+import gi
+
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk, GLib, Gdk  # noqa: E402
+
+import math  # noqa: E402
+import os  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+from collections import deque  # noqa: E402
+
+from sysmon_gpu import read_gpu  # noqa: E402
+
+HISTORY = 180          # samples retained (= 3 min at 1 Hz)
+INTERVAL = 1.0         # seconds between samples
+
+# ---- palette (dataviz reference instance, dark steps) ----------------------
+SURFACE = (0x1a / 255, 0x1a / 255, 0x19 / 255)
+CARD = (0x22 / 255, 0x22 / 255, 0x20 / 255)
+INK = (1.0, 1.0, 1.0)
+INK_2 = (0xc3 / 255, 0xc2 / 255, 0xb7 / 255)
+MUTED = (0x89 / 255, 0x87 / 255, 0x81 / 255)
+GRID = (0x2c / 255, 0x2c / 255, 0x2a / 255)
+
+SERIES_BLUE = (0x39 / 255, 0x87 / 255, 0xe5 / 255)     # slot 1
+SERIES_ORANGE = (0xd9 / 255, 0x59 / 255, 0x26 / 255)   # slot 2
+SERIES_AQUA = (0x19 / 255, 0x9e / 255, 0x70 / 255)     # slot 3
+SERIES_VIOLET = (0x90 / 255, 0x85 / 255, 0xe9 / 255)   # slot 7
+
+ST_GOOD = (0x0c / 255, 0xa3 / 255, 0x0c / 255)
+ST_WARNING = (0xfa / 255, 0xb2 / 255, 0x19 / 255)
+ST_CRITICAL = (0xd0 / 255, 0x3b / 255, 0x3b / 255)
+
+
+def status_for(v, warn, hot):
+    """-> (rgb, label). Label is mandatory: colour never carries state alone."""
+    if v is None:
+        return MUTED, "n/a"
+    if v >= hot:
+        return ST_CRITICAL, "Hot"
+    if v >= warn:
+        return ST_WARNING, "Warm"
+    return ST_GOOD, "Normal"
+
+
+# ---- sampling --------------------------------------------------------------
+def _hwmon_map():
+    out, base = {}, "/sys/class/hwmon"
+    for d in sorted(os.listdir(base)):
+        p = os.path.join(base, d)
+        try:
+            with open(os.path.join(p, "name")) as f:
+                out.setdefault(f.read().strip(), p)
+        except OSError:
+            pass
+    return out
+
+
+HW = _hwmon_map()
+
+
+def read_temp(dev, label):
+    p = HW.get(dev)
+    if not p:
+        return None
+    try:
+        for f in sorted(os.listdir(p)):
+            if not f.endswith("_label"):
+                continue
+            with open(os.path.join(p, f)) as fh:
+                if fh.read().strip() != label:
+                    continue
+            with open(os.path.join(p, f.replace("_label", "_input"))) as fh:
+                return int(fh.read().strip()) / 1000.0
+    except OSError:
+        pass
+    return None
+
+
+def read_cpu_times():
+    with open("/proc/stat") as f:
+        v = [int(x) for x in f.readline().split()[1:]]
+    return sum(v), v[3] + v[4]
+
+
+def read_mem():
+    d = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, val = line.split(":", 1)
+            d[k] = int(val.split()[0])
+    total = d["MemTotal"] / 1048576
+    return total - d["MemAvailable"] / 1048576, total
+
+
+class Sampler(threading.Thread):
+    """Polls in the background so nvidia-smi never blocks the UI thread."""
+
+    daemon = True
+
+    def __init__(self):
+        super().__init__()
+        self.lock = threading.Lock()
+        self.hist = {k: deque([], HISTORY) for k in
+                     ("cpu", "cpu_temp", "ram", "gpu", "gpu_temp", "vram")}
+        self.cur = {}
+        self._prev = read_cpu_times()
+
+    def run(self):
+        while True:
+            time.sleep(INTERVAL)
+            tot, idle = read_cpu_times()
+            dt, di = tot - self._prev[0], idle - self._prev[1]
+            cpu = (1 - di / dt) * 100 if dt > 0 else 0.0
+            self._prev = (tot, idle)
+
+            tctl = read_temp("k10temp", "Tctl")
+            tccd = read_temp("k10temp", "Tccd1")
+            used, total = read_mem()
+            g = read_gpu() or {}
+
+            with self.lock:
+                self.cur = {"cpu": cpu, "tctl": tctl, "tccd": tccd,
+                            "ram": used, "ram_total": total, **g}
+                self.hist["cpu"].append(cpu)
+                self.hist["cpu_temp"].append(tctl or 0)
+                self.hist["ram"].append(used / total * 100 if total else 0)
+                # GPU samples stay None when unreadable; the chart draws a
+                # gap there instead of a fake drop to zero.
+                self.hist["gpu"].append(g.get("util"))
+                self.hist["gpu_temp"].append(g.get("temp"))
+                vu, vt = g.get("vram"), g.get("vram_total")
+                self.hist["vram"].append(
+                    vu / vt * 100 if vu is not None and vt else None)
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.cur), {k: list(v) for k, v in self.hist.items()}
+
+
+# ---- drawing ---------------------------------------------------------------
+def rounded(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def text(cr, x, y, s, rgb, size, bold=False, right=None):
+    cr.select_font_face("sans-serif", 0, 1 if bold else 0)
+    cr.set_font_size(size)
+    cr.set_source_rgb(*rgb)
+    if right is not None:
+        x = right - cr.text_extents(s)[4]
+    cr.move_to(x, y)
+    cr.show_text(s)
+
+
+def runs(pts):
+    """Split a history into runs of consecutive (index, value) non-None points."""
+    out, cur = [], []
+    for i, v in enumerate(pts):
+        if v is None:
+            if cur:
+                out.append(cur)
+            cur = []
+        else:
+            cur.append((i, v))
+    if cur:
+        out.append(cur)
+    return out
+
+
+class Card(Gtk.DrawingArea):
+    """A stat tile: title, current value, and an area chart of recent history.
+
+    One series per card, so the title carries identity and no legend is needed.
+    """
+
+    def __init__(self, title, key, colour, vmax, fmt, sub=None, status=None):
+        super().__init__()
+        self.title, self.key, self.colour = title, key, colour
+        self.vmax, self.fmt, self.sub, self.status = vmax, fmt, sub, status
+        self.cur, self.hist = {}, []
+        self.set_content_height(152)
+        self.set_hexpand(True)
+        self.set_draw_func(self.draw)
+
+    def update(self, cur, hist):
+        self.cur, self.hist = cur, hist
+        self.queue_draw()
+
+    def draw(self, _area, cr, w, h):
+        rounded(cr, 0, 0, w, h, 10)
+        cr.set_source_rgb(*CARD)
+        cr.fill()
+
+        pad = 14
+        text(cr, pad, 24, self.title, INK_2, 12)
+
+        rgb = self.colour
+        label = None
+        if self.status:
+            val = self.cur.get(self.status[0])
+            rgb, label = status_for(val, self.status[1], self.status[2])
+
+        text(cr, pad, 54, self.fmt(self.cur), INK, 25, bold=True)
+        if label:
+            # icon + label pairing: status never rides on colour alone
+            cr.arc(w - pad - 46, 46, 4, 0, 2 * math.pi)
+            cr.set_source_rgb(*rgb)
+            cr.fill()
+            text(cr, 0, 50, label, INK_2, 12, right=w - pad)
+        if self.sub:
+            text(cr, 0, 50, self.sub(self.cur), MUTED, 11, right=w - pad)
+
+        # ---- area chart -----------------------------------------------------
+        gx, gy = pad, 66
+        gw, gh = w - pad * 2, h - gy - 12
+        if gh < 12:
+            return
+
+        # One recessive midline only. A gridline at 100% would sit directly
+        # under the value text and read as a divider rather than as chart.
+        cr.set_source_rgb(*GRID)
+        cr.set_line_width(1)
+        yy = gy + gh * 0.5 + 0.5
+        cr.move_to(gx, yy)
+        cr.line_to(gx + gw, yy)
+        cr.stroke()
+
+        pts = self.hist
+        if len(pts) < 2:
+            text(cr, gx, gy + gh / 2 + 4, "collecting…", MUTED, 11)
+            return
+
+        step = gw / (HISTORY - 1)
+        x0 = gx + gw - step * (len(pts) - 1)
+
+        def ypt(v):
+            return gy + gh - min(max(v / self.vmax, 0), 1) * gh
+
+        # None = unreadable sample: break the series there rather than plot 0.
+        for run in runs(pts):
+            if len(run) < 2:
+                continue
+            i0, i1 = run[0][0], run[-1][0]
+            cr.move_to(x0 + i0 * step, gy + gh)       # filled area
+            for i, v in run:
+                cr.line_to(x0 + i * step, ypt(v))
+            cr.line_to(x0 + i1 * step, gy + gh)
+            cr.close_path()
+            cr.set_source_rgba(*rgb, 0.18)
+            cr.fill()
+
+            cr.set_line_width(2)                      # 2px line
+            cr.move_to(x0 + i0 * step, ypt(run[0][1]))
+            for i, v in run:
+                cr.line_to(x0 + i * step, ypt(v))
+            cr.set_source_rgb(*rgb)
+            cr.stroke()
+
+
+def pct(k):
+    return lambda c: f"{c[k]:.0f}%" if c.get(k) is not None else "n/a"
+
+
+class Win(Gtk.ApplicationWindow):
+    def __init__(self, app, sampler):
+        super().__init__(application=app, title="System Monitor")
+        self.sampler = sampler
+        self.set_default_size(760, 520)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        root.set_margin_top(14)
+        root.set_margin_bottom(14)
+        root.set_margin_start(14)
+        root.set_margin_end(14)
+        self.set_child(root)
+
+        self.head = Gtk.Label(xalign=0)
+        self.head.set_markup(
+            '<span size="11000" foreground="#c3c2b7">'
+            'Ryzen 7 9700X  ·  RTX 5070</span>')
+        root.append(self.head)
+
+        grid = Gtk.Grid(column_spacing=10, row_spacing=10,
+                        column_homogeneous=True)
+        grid.set_vexpand(True)
+        root.append(grid)
+
+        vram_total = (self.sampler.cur.get("vram_total") or 12227) / 1024
+        self.cards = [
+            Card("CPU load", "cpu", SERIES_BLUE, 100, pct("cpu"),
+                 sub=lambda c: "16 threads"),
+            Card("CPU temperature", "cpu_temp", SERIES_BLUE, 100,
+                 lambda c: f"{c.get('tctl') or 0:.0f}°C",
+                 # Ryzen 9000 throttles at 95C; Tctl reads ~2C above the die.
+                 status=("tctl", 75, 90)),
+            Card("Memory", "ram", SERIES_AQUA, 100,
+                 lambda c: f"{c.get('ram') or 0:.1f} GiB",
+                 sub=lambda c: f"of {c.get('ram_total') or 0:.0f} GiB"),
+            Card("GPU utilisation", "gpu", SERIES_ORANGE, 100, pct("util"),
+                 sub=lambda c: (f"{c['sm']:.0f} MHz" if c.get("sm") else "")),
+            Card("GPU temperature", "gpu_temp", SERIES_ORANGE, 100,
+                 lambda c: (f"{c['temp']:.0f}°C" if c.get("temp") is not None
+                            else "n/a"),
+                 status=("temp", 75, 84)),
+            # VRAM sits near 100% whenever the SGLang server runs -- it
+            # preallocates its KV pool -- so this is deliberately NOT a status
+            # card. Red here would be a permanent false alarm.
+            Card("VRAM", "vram", SERIES_VIOLET, 100,
+                 lambda c: (f"{c['vram']/1024:.2f} GiB" if c.get("vram") is not None
+                            else "n/a"),
+                 sub=lambda c: f"of {vram_total:.1f} GiB"),
+        ]
+        for i, c in enumerate(self.cards):
+            grid.attach(c, i % 2, i // 2, 1, 1)
+
+        self.foot = Gtk.Label(xalign=0)
+        root.append(self.foot)
+
+        GLib.timeout_add(1000, self.tick)
+        self.tick()
+
+    def tick(self):
+        cur, hist = self.sampler.snapshot()
+        for c in self.cards:
+            c.update(cur, hist.get(c.key, []))
+        p, pl = cur.get("power"), cur.get("power_limit")
+        fan = cur.get("fan")
+        bits = []
+        if p is not None and pl:
+            bits.append(f"GPU power {p:.0f} / {pl:.0f} W")
+        if fan is not None:
+            bits.append(f"fan {fan:.0f}%")
+        if cur.get("tccd") is not None:
+            bits.append(f"CPU die {cur['tccd']:.0f}°C")
+        self.foot.set_markup(
+            f'<span size="10000" foreground="#898781">{"    ".join(bits)}</span>')
+        return True
+
+
+def main():
+    sampler = Sampler()
+    sampler.start()
+
+    app = Gtk.Application(application_id="local.sysmon.gui")
+
+    def on_activate(a):
+        # Without this the titlebar renders light against the dark window.
+        Gtk.Settings.get_default().set_property(
+            "gtk-application-prefer-dark-theme", True)
+        css = Gtk.CssProvider()
+        css.load_from_data(b"window { background-color: #1a1a19; }")
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        Win(a, sampler).present()
+
+    app.connect("activate", on_activate)
+    app.run(None)
+
+
+if __name__ == "__main__":
+    main()

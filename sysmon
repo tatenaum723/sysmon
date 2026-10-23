@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Compact CPU/GPU monitor for this box (Ryzen 7 9700X + RTX 5070).
+
+NVIDIA is NOT exposed through hwmon on this machine, so GPU stats come from
+nvidia-smi rather than /sys. CPU temp comes from k10temp (Tctl = control temp
+the boost algorithm uses; Tccd1 = the actual CCD die sensor).
+
+Usage:  sysmon [interval_seconds]      (default 1.0, Ctrl-C to quit)
+"""
+import os
+import sys
+import time
+
+import sysmon_gpu
+
+INTERVAL = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
+
+R = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+GREY = "\033[38;5;245m"
+
+
+def colour(v, warn, hot):
+    """green / yellow / red by threshold."""
+    if v >= hot:
+        return "\033[38;5;203m"
+    if v >= warn:
+        return "\033[38;5;221m"
+    return "\033[38;5;114m"
+
+
+def bar(pct, width=22, warn=70, hot=90):
+    pct = max(0.0, min(100.0, pct))
+    filled = int(round(pct / 100 * width))
+    c = colour(pct, warn, hot)
+    return f"{c}{'█' * filled}{GREY}{'░' * (width - filled)}{R}"
+
+
+def read_cpu_times():
+    with open("/proc/stat") as f:
+        parts = f.readline().split()[1:]
+    vals = [int(x) for x in parts]
+    idle = vals[3] + vals[4]          # idle + iowait
+    return sum(vals), idle
+
+
+def hwmon_map():
+    """name -> hwmon path"""
+    out = {}
+    base = "/sys/class/hwmon"
+    for d in sorted(os.listdir(base)):
+        p = os.path.join(base, d)
+        try:
+            with open(os.path.join(p, "name")) as f:
+                out.setdefault(f.read().strip(), p)
+        except OSError:
+            pass
+    return out
+
+
+HW = hwmon_map()
+
+
+def read_temp(hw_name, label_match):
+    """Read a labelled tempN_input from a named hwmon device, in Celsius."""
+    p = HW.get(hw_name)
+    if not p:
+        return None
+    try:
+        for f in sorted(os.listdir(p)):
+            if not f.endswith("_label"):
+                continue
+            with open(os.path.join(p, f)) as fh:
+                if fh.read().strip() != label_match:
+                    continue
+            with open(os.path.join(p, f.replace("_label", "_input"))) as fh:
+                return int(fh.read().strip()) / 1000.0
+    except OSError:
+        pass
+    return None
+
+
+def cpu_mhz():
+    try:
+        tot = n = 0
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("cpu MHz"):
+                    tot += float(line.split(":")[1])
+                    n += 1
+        return tot / n if n else None
+    except OSError:
+        return None
+
+
+def mem():
+    d = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            d[k] = int(v.split()[0])
+    total = d["MemTotal"] / 1048576
+    avail = d["MemAvailable"] / 1048576
+    return total - avail, total
+
+
+def fmt_temp(v, warn, hot, width=5):
+    if v is None:
+        return f"{GREY}{'n/a':>{width}}{R}"
+    return f"{colour(v, warn, hot)}{v:>{width-1}.0f}°{R}"
+
+
+def main():
+    prev_tot, prev_idle = read_cpu_times()
+    time.sleep(0.15)
+    print("\033[?25l", end="")  # hide cursor
+    prev_n = 0
+    try:
+        while True:
+            tot, idle = read_cpu_times()
+            dt, di = tot - prev_tot, idle - prev_idle
+            cpu_pct = (1 - di / dt) * 100 if dt > 0 else 0.0
+            prev_tot, prev_idle = tot, idle
+
+            tctl = read_temp("k10temp", "Tctl")
+            tccd = read_temp("k10temp", "Tccd1")
+            edge = read_temp("amdgpu", "edge")
+            # log=False: a stray stderr line would throw off the cursor-up
+            # redraw, so the reason is shown in the frame instead.
+            g = sysmon_gpu.read_gpu(log=False)
+            used, total = mem()
+            mhz = cpu_mhz()
+
+            lines = []
+            lines.append(f"{BOLD}Ryzen 7 9700X{R}{DIM}  ·  16 threads{R}")
+            lines.append(f"  load  {bar(cpu_pct)} {cpu_pct:5.1f}%"
+                         + (f"{DIM}  {mhz/1000:.2f} GHz{R}" if mhz else ""))
+            # Ryzen 9000 Tctl runs hot by design; 95C is the throttle point.
+            lines.append(f"  temp  Tctl {fmt_temp(tctl, 75, 90)}"
+                         f"   die {fmt_temp(tccd, 75, 90)}"
+                         f"{DIM}   iGPU {R}{fmt_temp(edge, 70, 85)}")
+            mem_pct = used / total * 100
+            lines.append(f"  ram   {bar(mem_pct)} {used:5.1f}/{total:.0f} GiB")
+            lines.append("")
+
+            if g:
+                lines.append(f"{BOLD}RTX 5070{R}{DIM}  ·  12 GB{R}")
+                # Any field can come back None ([N/A] from the driver): draw an
+                # empty bar and say n/a rather than passing it off as 0.
+                util = g['util']
+                lines.append(f"  util  {bar(util or 0)} "
+                             + (f"{util:5.1f}%" if util is not None else f"{GREY}  n/a{R}")
+                             + (f"{DIM}  {g['sm']:.0f} MHz{R}" if g['sm'] else ""))
+                vu, vt = g['vram'], g['vram_total']
+                # VRAM near 100% is normal here: SGLang preallocates its pool.
+                if vu is not None and vt:
+                    lines.append(f"  vram  {bar(vu / vt * 100, warn=101, hot=102)} "
+                                 f"{vu/1024:5.2f}/{vt/1024:.2f} GiB")
+                else:
+                    lines.append(f"  vram  {bar(0)} {GREY}  n/a{R}")
+                pw, pl = g['power'], g['power_limit']
+                if pw is not None and pl:
+                    lines.append(f"  power {bar(pw / pl * 100, warn=90, hot=98)} "
+                                 f"{pw:5.1f}/{pl:.0f} W")
+                else:
+                    lines.append(f"  power {bar(0)} "
+                                 + (f"{pw:5.1f} W" if pw is not None else f"{GREY}  n/a{R}"))
+                fan = f"{g['fan']:.0f}%" if g['fan'] is not None else "n/a"
+                lines.append(f"  temp  {fmt_temp(g['temp'], 75, 84)}"
+                             f"{DIM}          fan {fan}{R}")
+            else:
+                # Truncated: a wrapped line would also break the redraw.
+                lines.append(f"{GREY}RTX 5070 unavailable: "
+                             f"{(sysmon_gpu.last_error or '?')[:56]}{R}")
+
+            # Move up by the *previous* frame's height and clear below: the
+            # frame shrinks when the GPU drops out, which used to leave stale
+            # rows on screen.
+            if prev_n:
+                print(f"\033[{prev_n}A", end="")
+            prev_n = len(lines)
+            for ln in lines:
+                print(f"\033[2K{ln}")
+            print("\033[J", end="")
+            sys.stdout.flush()
+            time.sleep(INTERVAL)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("\033[?25h", end="")  # restore cursor
+
+
+if __name__ == "__main__":
+    main()
